@@ -1,34 +1,152 @@
-name: Publish 🐍 distribution 📦 to TestPyPI and PyPI
+name: Release Python distribution
 
 on:
-  pull_request:
-    branches:
-      - main
-    types: [closed]
+  push:
+    # Includes merged PRs, with publishing secrets available for fork merges too.
+    branches: [main]
+    tags: ['v*']
+  # Manual runs validate and save distributions without publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  Publish:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Check if Merge
-        if: github.event.pull_request.merged == true
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Setup 🐍
-        uses: actions/setup-python@v2
+      - name: Checkout release source
+        uses: actions/checkout@v6
         with:
-          python-version: '3.x'
-      - name: Install build
-        run: python -m pip install build
-      - name: Build a binary wheel and a source tarball
-        run: python -m build --sdist --wheel --outdir dist/
-      - name: Publish the distribution 📦 to Test PyPI
-        uses: pypa/gh-action-pypi-publish@master
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
+          # Match the declared Python 3.9 support and the legacy dependency pins.
+          python-version: '3.9'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install 'pip==25.3'
+          # Keep setup.py install (used by tests) working without changing source.
+          python -m pip install 'setuptools==57.5.0' 'wheel==0.37.1' 'build==1.2.2.post1' 'twine==6.1.0'
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          # codecov 2.1.12 is no longer available and is only a Travis uploader.
+          requirements = [
+              line for line in pathlib.Path("requirements-test.txt").read_text().splitlines()
+              if line.strip() and not line.lstrip().startswith(("#", "codecov=="))
+          ]
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt", *requirements])
+          PY
+          python -m pip check
+
+      - name: Check release tag against package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os
+          from cushead.info import PACKAGE_VERSION
+
+          expected = f"v{PACKAGE_VERSION}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(f"Release tag {actual!r} must match package version {expected!r}.")
+          PY
+
+      - name: Run all existing tests
+        run: python -m coverage run -m unittest discover -s tests -t . -v
+
+      - name: Report coverage
+        run: python -m coverage report
+
+      - name: Build distributions
+        run: |
+          # Packaging tests create these directories; publish only a fresh build.
+          rm -rf build dist cushead.egg-info
+          python -m build --no-isolation
+          python -m twine check --strict dist/*
+
+      - name: Save distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-testpypi:
+    needs: build
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Check TestPyPI token
+        env:
+          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TEST_PYPI_API_TOKEN" ]; then
+            echo '::error::Set the TEST_PYPI_API_TOKEN repository secret before publishing.'
+            exit 1
+          fi
+
+      - name: Download validated distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
-          repository_url: https://test.pypi.org/legacy/
-      - name: Publish the distribution 📦 to PyPI
-        if: startsWith(github.ref, 'refs/tags')
-        uses: pypa/gh-action-pypi-publish@master
+          repository-url: https://test.pypi.org/legacy/
+          # Merges may retain a version that has already been uploaded.
+          skip-existing: true
+          attestations: false
+
+  publish-pypi:
+    needs: [build, publish-testpypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Check PyPI token
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo '::error::Set the PYPI_API_TOKEN repository secret before publishing.'
+            exit 1
+          fi
+
+      - name: Download validated distributions
+        uses: actions/download-artifact@v4
         with:
+          name: python-distributions
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
+          # API-token authentication does not use OIDC attestations.
+          attestations: false
